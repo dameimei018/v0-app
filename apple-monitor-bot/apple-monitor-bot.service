@@ -1,0 +1,15 @@
+[Unit]
+Description=Apple App Store Removal Monitor Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apple-monitor-bot
+EnvironmentFile=/opt/apple-monitor-bot/.env
+ExecStart=/opt/apple-monitor-bot/venv/bin/python /opt/apple-monitor-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

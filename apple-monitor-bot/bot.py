@@ -1,0 +1,430 @@
+"""
+苹果 App Store 下架监控 Telegram 机器人
+- 仅监控指定 App 是否被下架（从指定商店消失）
+- 下架时向 TG 频道发送通知
+- 支持通过命令增删监控的 App
+- 支持管理员授权其他用户使用
+"""
+
+import os
+import re
+import html
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime, timezone
+
+import httpx
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# 可选：本地手动运行时从 .env 读取环境变量（用 systemd 部署时不依赖它）
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+# ---------------- 配置（从环境变量读取） ----------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]                       # @BotFather 给的 token
+ADMIN_ID = int(os.environ["ADMIN_ID"])                    # 你自己的 Telegram 数字 ID
+CHANNEL_ID = os.environ["CHANNEL_ID"]                     # 频道 @用户名 或 -100 开头的数字ID
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "180"))            # 检测间隔（秒）
+REMOVAL_CONFIRMATIONS = int(os.environ.get("REMOVAL_CONFIRMATIONS", "2"))  # 连续几次查不到才判定下架
+COUNTRY = os.environ.get("COUNTRY", "us")                 # 商店地区，默认美区
+DB_PATH = os.environ.get("DB_PATH", "monitor.db")         # SQLite 数据库文件路径
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("apple-monitor")
+
+APP_ID_RE = re.compile(r"id(\d+)")
+
+
+# ---------------- 工具函数 ----------------
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def esc(s) -> str:
+    return html.escape(str(s))
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS apps(
+            app_id TEXT PRIMARY KEY,
+            name TEXT,
+            added_by INTEGER,
+            added_at TEXT,
+            is_available INTEGER DEFAULT 1,
+            fail_count INTEGER DEFAULT 0,
+            notified_removed INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            role TEXT,
+            added_at TEXT
+        );
+        """
+    )
+    # 确保主管理员存在
+    conn.execute(
+        "INSERT OR REPLACE INTO users(user_id, role, added_at) VALUES(?,?,?)",
+        (ADMIN_ID, "admin", now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_authorized(user_id: int) -> bool:
+    conn = db()
+    row = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def is_admin(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    conn = db()
+    row = conn.execute("SELECT role FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None and row["role"] == "admin"
+
+
+def parse_app_id(text: str):
+    text = text.strip()
+    if text.isdigit():
+        return text
+    m = APP_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+# ---------------- 苹果接口查询 ----------------
+async def lookup_apps(app_ids):
+    """
+    返回 dict: app_id -> 状态
+      - 字符串(App名称) 表示在架
+      - False 表示成功拿到响应但里面没有这个ID（确认查不到）
+      - None  表示请求出错/超时（状态未知，本轮跳过）
+    """
+    result = {}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AppMonitorBot/1.0)"}
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        for i in range(0, len(app_ids), 100):  # 一次最多查 100 个
+            chunk = app_ids[i : i + 100]
+            params = {"id": ",".join(chunk), "country": COUNTRY, "entity": "software"}
+            try:
+                r = await client.get("https://itunes.apple.com/lookup", params=params)
+                r.raise_for_status()
+                data = r.json()
+                returned = {
+                    str(item.get("trackId")): item.get("trackName", "")
+                    for item in data.get("results", [])
+                }
+                for cid in chunk:
+                    result[cid] = returned.get(cid, False)
+            except Exception as e:
+                logger.warning("查询失败（本轮跳过该批）：%s", e)
+                for cid in chunk:
+                    result[cid] = None
+            await asyncio.sleep(1)  # 批次之间稍作间隔，温柔对待接口
+    return result
+
+
+# ---------------- 定时检测任务 ----------------
+async def check_apps(context: ContextTypes.DEFAULT_TYPE):
+    conn = db()
+    rows = conn.execute("SELECT * FROM apps").fetchall()
+    conn.close()
+    if not rows:
+        return
+
+    status = await lookup_apps([r["app_id"] for r in rows])
+
+    conn = db()
+    for r in rows:
+        aid = r["app_id"]
+        st = status.get(aid)
+
+        if st is None:
+            # 网络/接口异常，状态未知，跳过避免误报
+            continue
+
+        if st is False:
+            # 确认这次查不到
+            new_fail = r["fail_count"] + 1
+            conn.execute("UPDATE apps SET fail_count=? WHERE app_id=?", (new_fail, aid))
+            if new_fail >= REMOVAL_CONFIRMATIONS and not r["notified_removed"]:
+                conn.execute(
+                    "UPDATE apps SET is_available=0, notified_removed=1 WHERE app_id=?",
+                    (aid,),
+                )
+                conn.commit()
+                await notify_removed(context, r)
+        else:
+            # 在架：重置失败计数；如果之前判定过下架，说明重新上架了
+            if r["fail_count"] != 0 or r["notified_removed"] or not r["is_available"]:
+                conn.execute(
+                    "UPDATE apps SET fail_count=0, is_available=1, notified_removed=0 WHERE app_id=?",
+                    (aid,),
+                )
+            if st and st != r["name"]:
+                conn.execute("UPDATE apps SET name=? WHERE app_id=?", (st, aid))
+    conn.commit()
+    conn.close()
+
+
+async def notify_removed(context: ContextTypes.DEFAULT_TYPE, row):
+    name = row["name"] or row["app_id"]
+    url = f"https://apps.apple.com/{COUNTRY}/app/id{row['app_id']}"
+    text = (
+        "<b>【App 下架提醒】</b>\n\n"
+        f"名称：{esc(name)}\n"
+        f"App ID：<code>{row['app_id']}</code>\n"
+        f"商店：{COUNTRY.upper()}\n"
+        f"链接：{url}\n"
+        f"检测时间：{now()}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info("已通知下架：%s (%s)", name, row["app_id"])
+    except Exception as e:
+        logger.error("发送频道消息失败：%s", e)
+
+
+# ---------------- 命令处理 ----------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "苹果 App 下架监控机器人\n发送 /help 查看可用命令。"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    base = (
+        "<b>可用命令</b>\n"
+        "/add &lt;App链接或数字ID&gt; - 添加监控\n"
+        "/remove &lt;App ID&gt; - 删除监控\n"
+        "/list - 查看监控列表\n"
+        "/myid - 查看你自己的 Telegram ID\n"
+    )
+    admin = (
+        "\n<b>管理员命令</b>\n"
+        "/adduser &lt;用户ID&gt; - 授权用户使用\n"
+        "/removeuser &lt;用户ID&gt; - 取消授权\n"
+        "/users - 查看已授权用户\n"
+    )
+    text = base + (admin if is_admin(uid) else "")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"你的 Telegram ID：<code>{update.effective_user.id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        await update.message.reply_text("你没有权限，请联系管理员授权。")
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/add <App Store链接 或 纯数字ID>")
+        return
+
+    app_id = parse_app_id(" ".join(context.args))
+    if not app_id:
+        await update.message.reply_text("无法识别 App ID，请发送完整链接或纯数字ID。")
+        return
+
+    conn = db()
+    if conn.execute("SELECT 1 FROM apps WHERE app_id=?", (app_id,)).fetchone():
+        conn.close()
+        await update.message.reply_text("该 App 已在监控列表中。")
+        return
+    conn.close()
+
+    status = await lookup_apps([app_id])
+    st = status.get(app_id)
+    if st is None:
+        await update.message.reply_text("查询超时，请稍后重试。")
+        return
+    if st is False:
+        await update.message.reply_text("在该商店未找到此 App（ID 可能有误，或它已经下架）。")
+        return
+
+    name = st or app_id
+    conn = db()
+    conn.execute(
+        "INSERT INTO apps(app_id, name, added_by, added_at) VALUES(?,?,?,?)",
+        (app_id, name, uid, now()),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"已添加监控：\n{esc(name)}\nID：<code>{app_id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        await update.message.reply_text("你没有权限。")
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/remove <App ID>")
+        return
+
+    app_id = parse_app_id(" ".join(context.args))
+    if not app_id:
+        await update.message.reply_text("无法识别 App ID。")
+        return
+
+    conn = db()
+    cur = conn.execute("DELETE FROM apps WHERE app_id=?", (app_id,))
+    conn.commit()
+    conn.close()
+    if cur.rowcount:
+        await update.message.reply_text(
+            f"已删除监控：<code>{app_id}</code>", parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text("列表中没有该 App。")
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        await update.message.reply_text("你没有权限。")
+        return
+
+    conn = db()
+    rows = conn.execute("SELECT * FROM apps ORDER BY added_at").fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("监控列表为空。")
+        return
+
+    msg = f"共监控 {len(rows)} 个 App：\n\n"
+    for idx, r in enumerate(rows, 1):
+        flag = "在架" if r["is_available"] else "已下架"
+        line = f"{idx}. [{flag}] {esc(r['name'])}\n    ID：<code>{r['app_id']}</code>\n"
+        if len(msg) + len(line) > 3500:  # 防止超过 TG 单条消息长度上限
+            await update.message.reply_text(
+                msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+            )
+            msg = ""
+        msg += line
+    if msg.strip():
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
+
+
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("仅管理员可用。")
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("用法：/adduser <用户的数字ID>\n（让对方发送 /myid 获取）")
+        return
+
+    target = int(context.args[0])
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO users(user_id, role, added_at) VALUES(?,?,?)",
+        (target, "user", now()),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"已授权用户：<code>{target}</code>", parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("仅管理员可用。")
+        return
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("用法：/removeuser <用户ID>")
+        return
+
+    target = int(context.args[0])
+    if target == ADMIN_ID:
+        await update.message.reply_text("不能移除主管理员。")
+        return
+
+    conn = db()
+    cur = conn.execute("DELETE FROM users WHERE user_id=?", (target,))
+    conn.commit()
+    conn.close()
+    if cur.rowcount:
+        await update.message.reply_text(
+            f"已取消授权：<code>{target}</code>", parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text("该用户不在授权列表中。")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("仅管理员可用。")
+        return
+    conn = db()
+    rows = conn.execute("SELECT * FROM users ORDER BY added_at").fetchall()
+    conn.close()
+    lines = [f"- <code>{r['user_id']}</code>（{r['role']}）" for r in rows]
+    await update.message.reply_text(
+        "已授权用户：\n" + "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+# ---------------- 启动 ----------------
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("users", cmd_users))
+
+    app.job_queue.run_repeating(check_apps, interval=CHECK_INTERVAL, first=15)
+
+    logger.info("机器人已启动，检测间隔 %s 秒", CHECK_INTERVAL)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
