@@ -50,6 +50,36 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def parse_time(s: str):
+    """把存库的时间字符串解析回 datetime（UTC）。失败返回 None。"""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def format_duration(added_at: str) -> str:
+    """以录入机器人的时间为起点，计算并格式化在架时长。"""
+    start = parse_time(added_at)
+    if start is None:
+        return "未知"
+    delta = datetime.now(timezone.utc) - start
+    total_minutes = int(delta.total_seconds() // 60)
+    if total_minutes < 0:
+        total_minutes = 0
+    days, rem = divmod(total_minutes, 1440)
+    hours, minutes = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}天")
+    if hours:
+        parts.append(f"{hours}小时")
+    parts.append(f"{minutes}分钟")
+    return "".join(parts)
+
+
 def esc(s) -> str:
     return html.escape(str(s))
 
@@ -197,6 +227,8 @@ async def notify_removed(context: ContextTypes.DEFAULT_TYPE, row):
         f"App ID：<code>{row['app_id']}</code>\n"
         f"商店：{COUNTRY.upper()}\n"
         f"链接：{url}\n"
+        f"录入时间：{esc(row['added_at'])}\n"
+        f"监控时长：{format_duration(row['added_at'])}\n"
         f"检测时间：{now()}"
     )
     try:
@@ -283,7 +315,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text(
-        f"已添加监控：\n{esc(name)}\nID：<code>{app_id}</code>",
+        f"已添加监控：\n{esc(name)}\nID：<code>{app_id}</code>\n"
+        f"已开始计算在架时长（起点：{now()}）",
         parse_mode=ParseMode.HTML,
     )
 
@@ -329,8 +362,17 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = f"共监控 {len(rows)} 个 App：\n\n"
     for idx, r in enumerate(rows, 1):
-        flag = "在架" if r["is_available"] else "已下架"
-        line = f"{idx}. [{flag}] {esc(r['name'])}\n    ID：<code>{r['app_id']}</code>\n"
+        if r["is_available"]:
+            flag = "在架"
+            extra = f"    监控时长：{format_duration(r['added_at'])}\n"
+        else:
+            flag = "已下架"
+            extra = ""
+        line = (
+            f"{idx}. [{flag}] {esc(r['name'])}\n"
+            f"    ID：<code>{r['app_id']}</code>\n"
+            f"{extra}"
+        )
         if len(msg) + len(line) > 3500:  # 防止超过 TG 单条消息长度上限
             await update.message.reply_text(
                 msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True
