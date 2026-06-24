@@ -15,9 +15,14 @@ import sqlite3
 from datetime import datetime, timezone
 
 import httpx
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 # 可选：本地手动运行时从 .env 读取环境变量（用 systemd 部署时不依赖它）
 try:
@@ -243,10 +248,101 @@ async def notify_removed(context: ContextTypes.DEFAULT_TYPE, row):
         logger.error("发送频道消息失败：%s", e)
 
 
+# ---------------- 使用说明文案 ----------------
+GUIDE_OVERVIEW = (
+    "<b>📖 使用说明</b>\n\n"
+    "本机器人用于监控指定苹果 App 是否在 App Store 被下架，"
+    "一旦检测到下架会立即在频道发送提醒。\n\n"
+    "点击下方按钮查看对应说明 👇"
+)
+
+GUIDE_BASIC = (
+    "<b>🟢 基础使用</b>\n\n"
+    "<b>1. 添加监控</b>\n"
+    "发送 <code>/add App链接</code> 或 <code>/add 数字ID</code>\n"
+    "例：<code>/add https://apps.apple.com/us/app/id123456789</code>\n"
+    "或：<code>/add 123456789</code>\n"
+    "添加后会从<b>录入这一刻</b>开始计算监控时长。\n\n"
+    "<b>2. 删除监控</b>\n"
+    "发送 <code>/remove App的数字ID</code>\n"
+    "例：<code>/remove 123456789</code>\n\n"
+    "<b>3. 查看监控列表</b>\n"
+    "发送 <code>/list</code>，可看到全部 App 的在架/下架状态及监控时长。\n\n"
+    "<b>4. 查看你的 ID</b>\n"
+    "发送 <code>/myid</code> 获取自己的 Telegram 数字 ID。"
+)
+
+GUIDE_NOTIFY = (
+    "<b>🔔 下架提醒说明</b>\n\n"
+    f"• 机器人每 {CHECK_INTERVAL} 秒检测一次美区（默认）商店。\n"
+    f"• 为避免网络抖动误报，需连续 {REMOVAL_CONFIRMATIONS} 次查不到才判定下架。\n"
+    "• 判定下架后会自动在频道推送提醒，内容包含名称、ID、链接、录入时间与监控时长。\n"
+    "• 若 App 之后重新上架，状态会自动复位，下次再下架仍会提醒。\n"
+    "• 仅监控“下架”，不监控版本更新或价格变动。"
+)
+
+GUIDE_ADMIN = (
+    "<b>👑 管理员功能</b>\n\n"
+    "<b>授权他人使用本机器人：</b>\n"
+    "1. 让对方对机器人发送 <code>/myid</code> 获取其 ID\n"
+    "2. 你发送 <code>/adduser 对方ID</code> 即可授权\n\n"
+    "<b>取消授权：</b>\n"
+    "<code>/removeuser 对方ID</code>\n\n"
+    "<b>查看已授权用户：</b>\n"
+    "<code>/users</code>\n\n"
+    "未授权用户无法添加或删除监控。"
+)
+
+
+def guide_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🟢 基础使用", callback_data="guide_basic")],
+            [InlineKeyboardButton("🔔 下架提醒说明", callback_data="guide_notify")],
+            [InlineKeyboardButton("👑 管理员功能", callback_data="guide_admin")],
+        ]
+    )
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ 返回目录", callback_data="guide_home")]]
+    )
+
+
 # ---------------- 命令处理 ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "苹果 App 下架监控机器人\n发送 /help 查看可用命令。"
+        "👋 欢迎使用苹果 App 下架监控机器人！\n\n"
+        "发送 /help 查看可用命令，或点击下方按钮查看图文使用说明。",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📖 查看使用说明", callback_data="guide_home")]]
+        ),
+    )
+
+
+async def cmd_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        GUIDE_OVERVIEW, parse_mode=ParseMode.HTML, reply_markup=guide_keyboard()
+    )
+
+
+async def on_guide_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "guide_home":
+        text, kb = GUIDE_OVERVIEW, guide_keyboard()
+    elif data == "guide_basic":
+        text, kb = GUIDE_BASIC, back_keyboard()
+    elif data == "guide_notify":
+        text, kb = GUIDE_NOTIFY, back_keyboard()
+    elif data == "guide_admin":
+        text, kb = GUIDE_ADMIN, back_keyboard()
+    else:
+        return
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True
     )
 
 
@@ -257,6 +353,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/add &lt;App链接或数字ID&gt; - 添加监控\n"
         "/remove &lt;App ID&gt; - 删除监控\n"
         "/list - 查看监控列表\n"
+        "/guide - 查看图文使用说明\n"
         "/myid - 查看你自己的 Telegram ID\n"
     )
     admin = (
@@ -266,7 +363,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/users - 查看已授权用户\n"
     )
     text = base + (admin if is_admin(uid) else "")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📖 查看使用说明", callback_data="guide_home")]]
+        ),
+    )
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,6 +557,8 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("guide", cmd_guide))
+    app.add_handler(CallbackQueryHandler(on_guide_button, pattern=r"^guide_"))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
